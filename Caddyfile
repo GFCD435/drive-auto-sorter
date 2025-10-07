@@ -1,0 +1,9 @@
+{
+  email admin@example.com
+}
+
+{$APP_DOMAIN} {
+  @api path /login* /oauth2callback* /api* 
+  reverse_proxy @api api:8000
+  reverse_proxy app:10000
+}
