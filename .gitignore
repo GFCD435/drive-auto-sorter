@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+
+# Secrets / credentials
+.env
+credentials.json
+token.json
+.secrets/
+.streamlit/secrets.toml
+creds.b64
+
+# Logs & OS junk
+*.log
+nohup.out
+.DS_Store
+*.swp
+*.bak
