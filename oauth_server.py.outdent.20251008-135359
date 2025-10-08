@@ -3,33 +3,8 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from google_auth_oauthlib.flow import Flow
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://ui.gfcdapp.com",
-        "https://*.gfcdapp.com",
-    ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://ui.gfcdapp.com"],
-    allow_credentials=True,           # Cookie を跨いで使うので必須
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
 
 # --- Proxy/Host handling ---
 app.add_middleware(
@@ -40,11 +15,8 @@ app.add_middleware(
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 REDIRECT_URI = f"{BASE_URL}/oauth2callback"
 SCOPES = [
-    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/drive.readonly",
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
+    "openid", "email", "profile"
 ]
 
 COOKIE_NAME     = "das_state"
@@ -138,13 +110,10 @@ def oauth2callback(request: Request, state: str = "", code: str = ""):
         from fastapi.responses import PlainTextResponse
         return PlainTextResponse(f"fetch_token error: {type(e).__name__}: {e}", status_code=400)
     
-    print("CALLBACK OK: state=", state) 
+        print("CALLBACK OK: state=", state) 
     
-    # 後片付け（リプレイ対策）
-    save_state(cookie_state, {"used": True, "at": int(time.time())})
+        # 後片付け（リプレイ対策）
+        save_state(cookie_state, {"used": True, "at": int(time.time())})
     
-    nxt = rec.get("next") or "https://ui.gfcdapp.com/?authed=1"
-    return RedirectResponse(url=nxt, status_code=302)
-
-from api import router as app_router
-app.include_router(app_router, prefix="/api")
+        nxt = rec.get("next") or "https://ui.gfcdapp.com/?authed=1"
+        return RedirectResponse(url=nxt, status_code=302)
