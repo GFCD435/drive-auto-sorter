@@ -1,9 +1,15 @@
 {
-  email admin@example.com
+  email info@gfcd.co.jp
 }
 
 {$APP_DOMAIN} {
-  @api path /login* /oauth2callback* /api* 
+  @api path /login* /oauth2callback* /api*
+  reverse_proxy @api api:8000
+  reverse_proxy app:10000
+}
+
+ui.gfcdapp.com {
+  @api path /login* /oauth2callback* /api*
   reverse_proxy @api api:8000
   reverse_proxy app:10000
 }
