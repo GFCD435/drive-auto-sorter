@@ -53,27 +53,16 @@ COOKIE_SECURE   = True
 COOKIE_SAMESITE = "none"
 COOKIE_PATH     = "/"
 
-STATE_FILE = "/var/lib/das/state.json"
-os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+# セッション/クレデンシャル保存の共通モジュール
+from src import session
 
-def _state_load():
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _state_save(data: dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(data, f)
+# 既存の state ヘルパは session に置き換え
 
 def save_state(key, payload):
-    data = _state_load()
-    data[key] = payload
-    _state_save(data)
+    session.state_set(key, payload)
 
 def load_state(key):
-    return _state_load().get(key)
+    return session.state_get(key)
 
 def new_flow():
     client_config = {
@@ -139,6 +128,13 @@ def oauth2callback(request: Request, state: str = "", code: str = ""):
         return PlainTextResponse(f"fetch_token error: {type(e).__name__}: {e}", status_code=400)
     
     print("CALLBACK OK: state=", state) 
+    
+    # クレデンシャルを保存
+    try:
+        creds_json = flow.credentials.to_json()
+        session.creds_save(cookie_state, creds_json)
+    except Exception as e:
+        print("failed to save credentials:", e)
     
     # 後片付け（リプレイ対策）
     save_state(cookie_state, {"used": True, "at": int(time.time())})
