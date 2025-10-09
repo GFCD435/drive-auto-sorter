@@ -1,0 +1,8 @@
+{
+  "name": "drive-auto-sorter",
+  "dockerFile": "Dockerfile",
+  "forwardPorts": [8000, 8501],
+  "postCreateCommand": "python -m venv .venv && . .venv/bin/activate && pip install -U pip && pip install -r requirements.txt",
+  "remoteUser": "vscode",
+  "features": { "ghcr.io/devcontainers/features/common-utils:2": {} }
+}
