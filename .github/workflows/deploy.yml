@@ -1,0 +1,31 @@
+name: Deploy (Docker Compose)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Copy .env if exists
+        run: |
+          if [ -f .env.example ] && [ ! -f .env ]; then cp .env.example .env; fi
+
+      - name: Build and restart with Docker Compose
+        run: |
+          docker compose pull || true
+          docker compose build --no-cache
+          docker compose up -d --remove-orphans
+
+      - name: Show running containers
+        run: docker compose ps

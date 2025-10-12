@@ -5,11 +5,13 @@ from googleapiclient.errors import HttpError
 
 # 追加 import
 import os, io, json, re
-from googleapiclient.http import MediaIoBaseDownload
-from .ai_classifier import classify_with_ai
+from difflib import SequenceMatcher
+from googleapiclient.http import MediaIoBaseDownload  # type: ignore[import]
+from .ai_classifier import classify_with_ai, classify_title_with_ai
 from .extractors.pdf import extract_text_from_pdf_bytes
 from .extractors.image import extract_text_from_image_bytes
 from .extractors.excel import extract_text_from_xlsx
+from .category_rules import load_category_profiles  # type: ignore[import]
 
 CACHE_PATH = "/var/lib/das/classify-cache.json"
 os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
@@ -109,7 +111,7 @@ def sort_files_by_subfolder_name(service: Resource, parent_id: str) -> Tuple[Lis
 
 # ---- AI OCR + 分類 ----
 
-_DEF_TEXT_MAX = 500
+_DEF_TEXT_MAX = 2000
 _DEF_MAX_FILES = 100
 _DEF_MAX_BYTES = 20 * 1024 * 1024  # 20MB
 
@@ -119,6 +121,63 @@ def _norm(s: str) -> str:
     return _norm_rx.sub("", s).lower()
 
 _DEF_PLAIN_EXTS = {".txt", ".csv", ".md"}
+
+
+def _rule_score(subject: str, profile: Dict[str, Any]) -> float:
+    subject_norm = _norm(subject)
+    if not subject_norm:
+        return 0.0
+
+    excludes = profile.get("exclude") or []
+    for word in excludes:
+        if not word:
+            continue
+        if _norm(word) and _norm(word) in subject_norm:
+            return -1.0
+
+    includes = profile.get("include") or []
+    score = 0.0
+    for word in includes:
+        if not word:
+            continue
+        word_norm = _norm(word)
+        if word_norm and word_norm in subject_norm:
+            score += 1.0
+
+    if score > 0:
+        return score
+
+    name_norm = _norm(profile.get("name", ""))
+    if name_norm and name_norm in subject_norm:
+        return 0.5
+    return 0.0
+
+
+def _best_profile_by_rules(subject: str, profiles: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    best_profile: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    for profile in profiles:
+        score = _rule_score(subject, profile)
+        if score < 0:
+            continue
+        if score > best_score:
+            best_profile = profile
+            best_score = score
+    return best_profile if best_score > 0 else None
+
+
+def _best_profile_by_similarity(title: str, profiles: List[Dict[str, Any]], threshold: float = 0.82) -> Optional[Dict[str, Any]]:
+    title_lower = title.lower()
+    best_profile: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    for profile in profiles:
+        ratio = SequenceMatcher(None, title_lower, profile.get("name", "").lower()).ratio()
+        if ratio > best_score:
+            best_profile = profile
+            best_score = ratio
+    if best_score >= threshold:
+        return best_profile
+    return None
 
 
 def _download_bytes(service: Resource, file_id: str) -> bytes:
@@ -151,30 +210,124 @@ def _extract_text(name: str, mime: str, data: bytes) -> str:
 def ai_sort_files(service: Resource, parent_id: str, *, text_max: int=_DEF_TEXT_MAX, max_files: int=_DEF_MAX_FILES, max_bytes: int=_DEF_MAX_BYTES) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     - 親直下の子フォルダ名をカテゴリとして採用
-    - 親直下のファイルを順に: ダウンロード→OCR/抽出→AI分類→カテゴリ名と一致する子フォルダへ移動
+    - まずファイルタイトルだけで子フォルダ名と照合し、判定できれば即移動
+    - タイトルで判定できない場合にのみ: ダウンロード→OCR/抽出→AI分類→カテゴリ名と一致する子フォルダへ移動
     - マッチしなければ skipped
     - コスト制御: 件数上限、サイズ上限、テキスト長上限、結果キャッシュ(md5)
     """
     subfolders = list_subfolders(service, parent_id)
     files = list_files_directly_under(service, parent_id)
 
-    # 子フォルダの正規化辞書
-    sub_by_norm: Dict[str, Dict[str, str]] = {}
+    # カテゴリプロファイルをロード
+    profiles_by_name = load_category_profiles()
+
+    # 子フォルダの正規化辞書とタイトル照合用辞書
+    sub_by_norm: Dict[str, Dict[str, Any]] = {}
+    sub_by_lower: Dict[str, Dict[str, Any]] = {}
+    folder_profiles: List[Dict[str, Any]] = []
     for s in subfolders:
-        sub_by_norm[_norm(s["name"])] = {"id": s["id"], "name": s["name"]}
+        base_profile = profiles_by_name.get(s["name"], {})
+        folder_profile = {
+            "id": s["id"],
+            "name": s["name"],
+            "description": base_profile.get("description", ""),
+            "include": base_profile.get("include", []),
+            "exclude": base_profile.get("exclude", []),
+        }
+        folder_profiles.append(folder_profile)
+        sub_by_norm[_norm(s["name"])] = folder_profile
+        sub_by_lower[s["name"].lower()] = folder_profile
 
     cache = _load_cache()
 
     moved: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
-    processed = 0
+    ai_calls = 0
     for f in files:
-        if processed >= max_files:
-            break
         fid = f.get("id")
         fname = f.get("name", "")
         mime = f.get("mimeType", "")
+
+        dest_profile: Optional[Dict[str, Any]] = None
+        method = ""
+        cat_method = ""
+
+        rule_profile = _best_profile_by_rules(fname, folder_profiles)
+        if rule_profile:
+            dest_profile = rule_profile
+            method = "title_rule"
+
+        title_norm = _norm(fname)
+        title_lower = fname.lower()
+        if not dest_profile:
+            for sub_norm, sub in sub_by_norm.items():
+                if sub_norm and sub_norm in title_norm:
+                    dest_profile = sub
+                    method = "title_substring"
+                    break
+        if not dest_profile:
+            for sub_lower, sub in sub_by_lower.items():
+                if sub_lower and sub_lower in title_lower:
+                    dest_profile = sub
+                    method = "title_substring"
+                    break
+
+        if not dest_profile:
+            similar_profile = _best_profile_by_similarity(fname, folder_profiles)
+            if similar_profile:
+                dest_profile = similar_profile
+                method = "title_similarity"
+
+        if dest_profile:
+            try:
+                res = move_file(service, file_id=fid, dest_folder_id=dest_profile["id"])
+                moved.append({
+                    "file_id": res.get("id", fid),
+                    "name": res.get("name", fname),
+                    "to_folder": dest_profile["name"],
+                    "category": dest_profile["name"],
+                    "method": method or "title",
+                })
+                continue
+            except HttpError as e:
+                skipped.append({"file_id": fid, "name": fname, "reason": f"move_failed:{e}"})
+                continue
+
+        # タイトルだけでは決められない場合、GPTで近似カテゴリを確認
+        if folder_profiles:
+            if ai_calls >= max_files:
+                skipped.append({"file_id": fid, "name": fname, "reason": "ai_limit_reached"})
+                continue
+            try:
+                title_guess = classify_title_with_ai(fname, folder_profiles)
+                ai_calls += 1
+            except Exception as e:
+                skipped.append({"file_id": fid, "name": fname, "reason": f"title_ai_failed:{e}"})
+                continue
+            if title_guess and title_guess.upper() != "NONE":
+                norm_guess = _norm(title_guess)
+                dest = sub_by_norm.get(norm_guess)
+                if not dest:
+                    for sub_norm, sub in sub_by_norm.items():
+                        if sub_norm and (sub_norm in norm_guess or norm_guess in sub_norm):
+                            dest = sub
+                            break
+                if dest:
+                    try:
+                        res = move_file(service, file_id=fid, dest_folder_id=dest["id"])
+                        moved.append({
+                            "file_id": res.get("id", fid),
+                            "name": res.get("name", fname),
+                            "to_folder": dest["name"],
+                            "category": dest["name"],
+                            "method": "title_ai",
+                            "ai_label": title_guess,
+                        })
+                        continue
+                    except HttpError as e:
+                        skipped.append({"file_id": fid, "name": fname, "reason": f"move_failed:{e}"})
+                        continue
 
         # 追加メタ: size, md5
         meta = service.files().get(fileId=fid, fields="size,md5Checksum").execute()
@@ -186,21 +339,38 @@ def ai_sort_files(service: Resource, parent_id: str, *, text_max: int=_DEF_TEXT_
 
         # キャッシュ判定
         cat: Optional[str] = cache.get(md5) if md5 else None
+        if cat and not cat_method:
+            cat_method = "cache"
         text = ""
         if not cat:
+            if ai_calls >= max_files:
+                skipped.append({"file_id": fid, "name": fname, "reason": "ai_limit_reached"})
+                continue
             try:
                 data = _download_bytes(service, fid)
             except Exception as e:
                 skipped.append({"file_id": fid, "name": fname, "reason": f"download_failed:{e}"})
                 continue
             text = _extract_text(fname, mime, data)[:text_max]
-            try:
-                cat = classify_with_ai(fname, text) if text else None
-            except Exception as e:
-                skipped.append({"file_id": fid, "name": fname, "reason": f"ai_failed:{e}"})
-                continue
-            if md5 and cat:
+            if text:
+                text_profile = _best_profile_by_rules(text, folder_profiles)
+                if text_profile:
+                    cat = text_profile["name"]
+                    cat_method = "content_rule"
+                else:
+                    try:
+                        cat = classify_with_ai(fname, text, folder_profiles)
+                        ai_calls += 1
+                        cat_method = "content_ai"
+                    except Exception as e:
+                        skipped.append({"file_id": fid, "name": fname, "reason": f"ai_failed:{e}"})
+                        continue
+            if md5 and cat and cat.upper() != "NONE":
                 cache[md5] = cat
+
+        if cat and cat.upper() == "NONE":
+            skipped.append({"file_id": fid, "name": fname, "reason": "ai_returned_none"})
+            continue
 
         # マッチング（正規化して完全一致、なければ部分一致）
         norm_cat = _norm(cat or "")
@@ -219,13 +389,16 @@ def ai_sort_files(service: Resource, parent_id: str, *, text_max: int=_DEF_TEXT_
 
         try:
             res = move_file(service, file_id=fid, dest_folder_id=dest["id"])
-            moved.append({
+            entry = {
                 "file_id": res.get("id", fid),
                 "name": res.get("name", fname),
                 "to_folder": dest["name"],
                 "category": cat,
-            })
-            processed += 1
+                "method": cat_method or "content",
+            }
+            if cat_method in {"content_ai", "cache"}:
+                entry["ai_label"] = cat
+            moved.append(entry)
         except HttpError as e:
             skipped.append({"file_id": fid, "name": fname, "reason": f"move_failed:{e}"})
 
